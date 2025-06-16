@@ -138,6 +138,18 @@ static void (*_srandom)(unsigned int seed);
 static int (*_shmget)(key_t key, size_t size, int shmflg);
 static void *(*_shmat)(int shmid, const void *shmaddr, int shmflg);
 
+/* Additional socket function pointers for metrics support */
+static int (*_bind)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+static int (*_listen)(int sockfd, int backlog);
+static int (*_accept)(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+static int (*_getsockname)(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+static int (*_setsockopt)(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
+static int (*_getsockopt)(int sockfd, int level, int optname, void *optval, socklen_t *optlen);
+static ssize_t (*_sendto)(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen);
+static ssize_t (*_recvfrom)(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen);
+static ssize_t (*_sendmsg)(int sockfd, const struct msghdr *msg, int flags);
+static int (*_shutdown)(int sockfd, int how);
+
 static unsigned int node;
 static int initializing = 0;
 static int initialized_symbols = 0;
@@ -190,6 +202,7 @@ struct socket {
 	int broadcast;
 	int pkt_info;
 	int time_stamping;
+	int is_metrics_socket;  /* Flag to track if socket path contains "metrics" */
 	struct message last_ts_msg;
 	struct message buffer;
 };
@@ -290,6 +303,18 @@ static void init_symbols(void) {
 	_srandom = (void (*)(unsigned int seed))dlsym(RTLD_NEXT, "srandom");
 	_shmget = (int (*)(key_t key, size_t size, int shmflg))dlsym(RTLD_NEXT, "shmget");
 	_shmat = (void *(*)(int shmid, const void *shmaddr, int shmflg))dlsym(RTLD_NEXT, "shmat");
+
+	/* Initialize additional socket function pointers for metrics support */
+	_bind = (int (*)(int sockfd, const struct sockaddr *addr, socklen_t addrlen))dlsym(RTLD_NEXT, "bind");
+	_listen = (int (*)(int sockfd, int backlog))dlsym(RTLD_NEXT, "listen");
+	_accept = (int (*)(int sockfd, struct sockaddr *addr, socklen_t *addrlen))dlsym(RTLD_NEXT, "accept");
+	_getsockname = (int (*)(int sockfd, struct sockaddr *addr, socklen_t *addrlen))dlsym(RTLD_NEXT, "getsockname");
+	_setsockopt = (int (*)(int sockfd, int level, int optname, const void *optval, socklen_t optlen))dlsym(RTLD_NEXT, "setsockopt");
+	_getsockopt = (int (*)(int sockfd, int level, int optname, void *optval, socklen_t *optlen))dlsym(RTLD_NEXT, "getsockopt");
+	_sendto = (ssize_t (*)(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen))dlsym(RTLD_NEXT, "sendto");
+	_recvfrom = (ssize_t (*)(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen))dlsym(RTLD_NEXT, "recvfrom");
+	_sendmsg = (ssize_t (*)(int sockfd, const struct msghdr *msg, int flags))dlsym(RTLD_NEXT, "sendmsg");
+	_shutdown = (int (*)(int sockfd, int how))dlsym(RTLD_NEXT, "shutdown");
 
 	initialized_symbols = 1;
 }
@@ -730,6 +755,21 @@ static int get_socket_from_fd(int fd) {
 
 static int get_socket_fd(int s) {
 	return s + BASE_SOCKET_FD;
+}
+
+/* Check if a Unix socket path contains "metrics" */
+static int path_contains_metrics(const char *path) {
+	if (!path)
+		return 0;
+	return strstr(path, "metrics") != NULL;
+}
+
+/* Check if a socket is a metrics socket */
+static int is_metrics_socket(int sockfd) {
+	int s = get_socket_from_fd(sockfd);
+	if (s < 0)
+		return 0;
+	return sockets[s].is_metrics_socket;
 }
 
 static int find_recv_socket(struct Reply_select *rep) {
@@ -1692,6 +1732,12 @@ int close(int fd) {
 	} else if ((t = get_timer_from_fd(fd)) >= 0) {
 		return timer_delete_(get_timerid(t));
 	} else if ((s = get_socket_from_fd(fd)) >= 0) {
+		/* Handle metrics sockets - use real system calls */
+		if (sockets[s].is_metrics_socket) {
+			sockets[s].used = 0;
+			return _close(fd);
+		}
+		
 		if (sockets[s].type == SOCK_STREAM)
 			shutdown(fd, SHUT_RDWR);
 		sockets[s].used = 0;
@@ -1726,6 +1772,7 @@ int socket(int domain, int type, int protocol) {
 	sockets[s].iface = domain == AF_UNIX ? IFACE_UNIX : IFACE_ALL;
 	sockets[s].remote_node = -1;
 	sockets[s].remote_port = -1;
+	sockets[s].is_metrics_socket = 0;  /* Initialize metrics socket flag */
 
 	return get_socket_fd(s);
 }
@@ -1733,8 +1780,17 @@ int socket(int domain, int type, int protocol) {
 int listen(int sockfd, int backlog) {
 	int s = get_socket_from_fd(sockfd);
 
-	if (s < 0 || (sockets[s].domain != AF_INET && sockets[s].domain != AF_INET6) ||
-	    sockets[s].type != SOCK_STREAM) {
+	if (s < 0 || (sockets[s].domain != AF_INET && sockets[s].domain != AF_INET6)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _listen(sockfd, backlog);
+	}
+
+	if (sockets[s].type != SOCK_STREAM) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -1752,6 +1808,11 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 	    sockets[s].type != SOCK_STREAM) {
 		errno = EINVAL;
 		return -1;
+	}
+
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _accept(sockfd, addr, addrlen);
 	}
 
 	make_request(REQ_RECV, NULL, 0, &rep, sizeof (rep));
@@ -1784,6 +1845,11 @@ int shutdown(int sockfd, int how) {
 		return -1;
 	}
 
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _shutdown(sockfd, how);
+	}
+
 	assert(sockets[s].domain == AF_INET || sockets[s].domain == AF_INET6);
 	assert(sockets[s].type == SOCK_STREAM);
 
@@ -1805,6 +1871,23 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 	if (s < 0) {
 		errno = EINVAL;
 		return -1;
+	}
+
+	/* Check if this is a Unix socket with a path containing "metrics" */
+	if (addr->sa_family == AF_UNIX) {
+		sun = (struct sockaddr_un *)addr;
+		if (addrlen > offsetof(struct sockaddr_un, sun_path) + 1) {
+			if (path_contains_metrics(sun->sun_path)) {
+				sockets[s].is_metrics_socket = 1;
+				/* Use real system call for metrics sockets */
+				return _connect(sockfd, addr, addrlen);
+			}
+		}
+	}
+
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _connect(sockfd, addr, addrlen);
 	}
 
 	switch (addr->sa_family) {
@@ -1847,12 +1930,30 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 	int s = get_socket_from_fd(sockfd), port;
 	struct sockaddr_in6 *sin6;
 	struct sockaddr_in *sin;
+	struct sockaddr_un *sun;
 	uint32_t a;
 	static int unix_sockets = 0;
 
 	if (s < 0) {
 		errno = EINVAL;
 		return -1;
+	}
+
+	/* Check if this is a Unix socket with a path containing "metrics" */
+	if (addr->sa_family == AF_UNIX) {
+		sun = (struct sockaddr_un *)addr;
+		if (addrlen > offsetof(struct sockaddr_un, sun_path) + 1) {
+			if (path_contains_metrics(sun->sun_path)) {
+				sockets[s].is_metrics_socket = 1;
+				/* Use real system call for metrics sockets */
+				return _bind(sockfd, addr, addrlen);
+			}
+		}
+	}
+
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _bind(sockfd, addr, addrlen);
 	}
 
 	switch (addr->sa_family) {
@@ -1926,6 +2027,11 @@ int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 		return -1;
 	}
 
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _getsockname(sockfd, addr, addrlen);
+	}
+
 	if (sockets[s].domain == AF_INET6) {
 		return !set_sockaddr(sockets[s].domain, sockets[s].iface - IFACE_ETH0,
 				     node, sockets[s].port, addr, addrlen);
@@ -1967,6 +2073,11 @@ int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t
 		return -1;
 	}
 
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _setsockopt(sockfd, level, optname, optval, optlen);
+	}
+
 	if (level == SOL_SOCKET && optname == SO_BINDTODEVICE) {
 		if (!strcmp(optval, "lo"))
 			sockets[s].iface = IFACE_LO;
@@ -2000,6 +2111,11 @@ int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optl
 	if (s < 0 || (sockets[s].domain != AF_INET && sockets[s].domain != AF_INET6)) {
 		errno = EINVAL;
 		return -1;
+	}
+
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _getsockopt(sockfd, level, optname, optval, optlen);
 	}
 
 	if (level == SOL_SOCKET && optname == SO_ERROR && *optlen == sizeof (int)) {
@@ -2419,6 +2535,11 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
 		return -1;
 	}
 
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _sendmsg(sockfd, msg, flags);
+	}
+
 	if (sockets[s].remote_node >= 0) {
 		if (msg->msg_name) {
 			errno = EISCONN;
@@ -2507,6 +2628,11 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct 
 	struct msghdr msg;
 	struct iovec iov;
 
+	/* Handle metrics sockets - use real system calls */
+	if (is_metrics_socket(sockfd)) {
+		return _sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+	}
+
 	iov.iov_base = (void *)buf;
 	iov.iov_len = len;
 
@@ -2521,6 +2647,11 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct 
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
+	/* Handle metrics sockets - use real system calls */
+	if (is_metrics_socket(sockfd)) {
+		return _send(sockfd, buf, len, flags);
+	}
+
 	return sendto(sockfd, buf, len, flags, NULL, 0);
 }
 
@@ -2575,6 +2706,11 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
 		return _recvmsg(sockfd, msg, flags);
 
 	assert(s >= 0);
+
+	/* Handle metrics sockets - use real system calls */
+	if (sockets[s].is_metrics_socket) {
+		return _recvmsg(sockfd, msg, flags);
+	}
 
 	if (sockets[s].last_ts_msg.len && flags & MSG_ERRQUEUE) {
 		/* last message looped back to the error queue */
@@ -2781,6 +2917,11 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *
 	struct msghdr msg;
 	struct iovec iov;
 
+	/* Handle metrics sockets - use real system calls */
+	if (is_metrics_socket(sockfd)) {
+		return _recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
+	}
+
 	iov.iov_base = (void *)buf;
 	iov.iov_len = len;
 
@@ -2807,6 +2948,11 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
 		struct sockaddr_un sun;
 	} sa;
 	socklen_t addrlen = sizeof (sa);
+
+	/* Handle metrics sockets - use real system calls */
+	if (is_metrics_socket(sockfd)) {
+		return _recvfrom(sockfd, buf, len, flags, (struct sockaddr *)&sa, &addrlen);
+	}
 
 	return recvfrom(sockfd, buf, len, flags, (struct sockaddr *)&sa, &addrlen);
 }
