@@ -132,6 +132,7 @@ static int (*_close)(int fd);
 static int (*_socket)(int domain, int type, int protocol);
 static int (*_connect)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 static ssize_t (*_recvmsg)(int sockfd, struct msghdr *msg, int flags);
+static ssize_t (*_recv)(int sockfd, void *buf, size_t len, int flags);
 static ssize_t (*_send)(int sockfd, const void *buf, size_t len, int flags);
 static int (*_usleep)(useconds_t usec);
 static void (*_srandom)(unsigned int seed);
@@ -155,6 +156,8 @@ static int initializing = 0;
 static int initialized_symbols = 0;
 static int initialized = 0;
 static int clknetsim_fd = -1;
+static struct sockaddr_un server_socket;
+static unsigned int server_connect_retries;
 static int precision_hack = 1;
 static unsigned int random_seed = 0;
 static int ip_family = 4;
@@ -299,6 +302,7 @@ static void init_symbols(void) {
 	_socket = (int (*)(int domain, int type, int protocol))dlsym(RTLD_NEXT, "socket");
 	_connect = (int (*)(int sockfd, const struct sockaddr *addr, socklen_t addrlen))dlsym(RTLD_NEXT, "connect");
 	_recvmsg = (ssize_t (*)(int sockfd, struct msghdr *msg, int flags))dlsym(RTLD_NEXT, "recvmsg");
+	_recv = (ssize_t (*)(int sockfd, void *buf, size_t len, int flags))dlsym(RTLD_NEXT, "recv");
 	_send = (ssize_t (*)(int sockfd, const void *buf, size_t len, int flags))dlsym(RTLD_NEXT, "send");
 	_usleep = (int (*)(useconds_t usec))dlsym(RTLD_NEXT, "usleep");
 	_srandom = (void (*)(unsigned int seed))dlsym(RTLD_NEXT, "srandom");
@@ -324,8 +328,6 @@ __attribute__((constructor))
 static void init(void) {
 	unsigned int connect_retries = 100; /* 10 seconds */
 	struct sockaddr_un s = {AF_UNIX, "clknetsim.sock"};
-	struct Request_register req;
-	struct Reply_register rep;
 	const char *env;
 	char command[64];
 	FILE *f;
@@ -437,17 +439,7 @@ static void init(void) {
 	if (env)
 		connect_retries = 10 * atoi(env);
 
-	clknetsim_fd = _socket(AF_UNIX, SOCK_SEQPACKET, 0);
-
-	assert(clknetsim_fd >= 0);
-
-	while (_connect(clknetsim_fd, (struct sockaddr *)&s, sizeof (s)) < 0) {
-		if (!--connect_retries) {
-			fprintf(stderr, "clknetsim: could not connect to server.\n");
-			exit(1);
-		}
-		_usleep(100000);
-	}
+	clknetsim_fd = -1;  /* Initialize as disconnected */
 
 	/* this requires the node variable to be already set */
 	srandom(0);
@@ -455,10 +447,15 @@ static void init(void) {
 	initializing = 0;
 	initialized = 1;
 
-	req.node = node;
-	make_request(REQ_REGISTER, &req, sizeof (req), &rep, sizeof (rep));
+	/* Store connection parameters for lazy connection */
+	server_socket = s;
+	server_connect_retries = connect_retries;
 
-	subnets = rep.subnets;
+	/* Initialize default values for socket support without server */
+	if (unix_subnet < 0)
+		unix_subnet = 1;  /* Default Unix subnet */
+	if (subnets == 0)
+		subnets = 2;      /* Default number of subnets */
 }
 
 __attribute__((destructor))
@@ -473,6 +470,48 @@ static void fini(void) {
 		close(clknetsim_fd);
 }
 
+/* Connect to server on demand */
+static int connect_to_server(void) {
+	struct Request_register req;
+	struct Reply_register rep;
+	unsigned int retries = server_connect_retries;
+
+	if (clknetsim_fd >= 0)
+		return 0; /* Already connected */
+
+	clknetsim_fd = _socket(AF_UNIX, SOCK_SEQPACKET, 0);
+	if (clknetsim_fd < 0)
+		return -1;
+
+	while (_connect(clknetsim_fd, (struct sockaddr *)&server_socket, sizeof(server_socket)) < 0) {
+		if (!--retries) {
+			_close(clknetsim_fd);
+			clknetsim_fd = -1;
+			return -1;
+		}
+		_usleep(100000);
+	}
+
+	/* Register with server using proper protocol */
+	req.node = node;
+	{
+		struct Request_packet request;
+		request.header.request = REQ_REGISTER;
+		request.header._pad = 0;
+		memcpy(&request.data, &req, sizeof(req));
+		
+		if (_send(clknetsim_fd, &request, offsetof(struct Request_packet, data) + sizeof(req), 0) <= 0 ||
+			_recv(clknetsim_fd, &rep, sizeof(rep), 0) <= 0) {
+			_close(clknetsim_fd);
+			clknetsim_fd = -1;
+			return -1;
+		}
+	}
+
+	subnets = rep.subnets;
+	return 0;
+}
+
 static void make_request(int request_id, const void *request_data, int reqlen, void *reply, int replylen) {
 	struct Request_packet request;
 	int sent, received = 0;
@@ -482,6 +521,12 @@ static void make_request(int request_id, const void *request_data, int reqlen, v
 	if (fuzz_mode) {
 		fuzz_process_request(request_id, request_data, reply, replylen);
 		return;
+	}
+
+	/* Connect to server if needed */
+	if (connect_to_server() < 0) {
+		fprintf(stderr, "clknetsim: could not connect to server.\n");
+		exit(1);
 	}
 
 	request.header.request = request_id;
@@ -1784,9 +1829,10 @@ int close(int fd) {
 int socket(int domain, int type, int protocol) {
 	int s;
 
+	/* Allow Unix sockets even without server connection for metrics bypass */
 	if (((domain != AF_INET || ip_family == 6) &&
 	     (domain != AF_INET6 || ip_family == 4) &&
-	     (domain != AF_UNIX || unix_subnet < 0)) ||
+	     domain != AF_UNIX) ||
 	    (type != SOCK_DGRAM && type != SOCK_STREAM)) {
 		errno = EINVAL;
 		return -1;
