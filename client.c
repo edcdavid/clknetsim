@@ -439,23 +439,59 @@ static void init(void) {
 	if (env)
 		connect_retries = 10 * atoi(env);
 
-	clknetsim_fd = -1;  /* Initialize as disconnected */
+	/* Store connection parameters for potential lazy connection */
+	server_socket = s;
+	server_connect_retries = connect_retries;
+
+	/* Check if lazy connection is requested (for metrics socket support) */
+	env = getenv("CLKNETSIM_LAZY_CONNECT");
+	if (env && atoi(env)) {
+		/* Lazy connection mode - defer server connection */
+		clknetsim_fd = -1;
+		/* Initialize default values for socket support without server */
+		if (unix_subnet < 0)
+			unix_subnet = 1;  /* Default Unix subnet */
+		if (subnets == 0)
+			subnets = 2;      /* Default number of subnets */
+	} else {
+		/* Normal mode - connect to server immediately (original behavior) */
+		clknetsim_fd = _socket(AF_UNIX, SOCK_SEQPACKET, 0);
+		assert(clknetsim_fd >= 0);
+
+		while (_connect(clknetsim_fd, (struct sockaddr *)&s, sizeof (s)) < 0) {
+			if (!--connect_retries) {
+				fprintf(stderr, "clknetsim: could not connect to server.\n");
+				exit(1);
+			}
+			_usleep(100000);
+		}
+
+		/* Register with server using proper protocol */
+		{
+			struct Request_register req;
+			struct Reply_register rep;
+			struct Request_packet request;
+			
+			req.node = node;
+			request.header.request = REQ_REGISTER;
+			request.header._pad = 0;
+			memcpy(&request.data, &req, sizeof(req));
+			
+			if (_send(clknetsim_fd, &request, offsetof(struct Request_packet, data) + sizeof(req), 0) <= 0 ||
+				_recv(clknetsim_fd, &rep, sizeof(rep), 0) <= 0) {
+				fprintf(stderr, "clknetsim: could not register with server.\n");
+				exit(1);
+			}
+			
+			subnets = rep.subnets;
+		}
+	}
 
 	/* this requires the node variable to be already set */
 	srandom(0);
 
 	initializing = 0;
 	initialized = 1;
-
-	/* Store connection parameters for lazy connection */
-	server_socket = s;
-	server_connect_retries = connect_retries;
-
-	/* Initialize default values for socket support without server */
-	if (unix_subnet < 0)
-		unix_subnet = 1;  /* Default Unix subnet */
-	if (subnets == 0)
-		subnets = 2;      /* Default number of subnets */
 }
 
 __attribute__((destructor))
@@ -470,7 +506,7 @@ static void fini(void) {
 		close(clknetsim_fd);
 }
 
-/* Connect to server on demand */
+/* Connect to server on demand (only used in lazy mode) */
 static int connect_to_server(void) {
 	struct Request_register req;
 	struct Reply_register rep;
@@ -478,6 +514,13 @@ static int connect_to_server(void) {
 
 	if (clknetsim_fd >= 0)
 		return 0; /* Already connected */
+
+	/* Only connect if we're in lazy mode */
+	const char *env = getenv("CLKNETSIM_LAZY_CONNECT");
+	if (!env || !atoi(env)) {
+		/* Not in lazy mode, should already be connected */
+		return clknetsim_fd >= 0 ? 0 : -1;
+	}
 
 	clknetsim_fd = _socket(AF_UNIX, SOCK_SEQPACKET, 0);
 	if (clknetsim_fd < 0)
@@ -1829,10 +1872,16 @@ int close(int fd) {
 int socket(int domain, int type, int protocol) {
 	int s;
 
-	/* Allow Unix sockets even without server connection for metrics bypass */
+	/* Check if we should allow Unix sockets without server connection */
+	int allow_unix_without_server = 0;
+	const char *lazy_env = getenv("CLKNETSIM_LAZY_CONNECT");
+	if (lazy_env && atoi(lazy_env)) {
+		allow_unix_without_server = 1;
+	}
+
 	if (((domain != AF_INET || ip_family == 6) &&
 	     (domain != AF_INET6 || ip_family == 4) &&
-	     domain != AF_UNIX) ||
+	     (domain != AF_UNIX || (!allow_unix_without_server && unix_subnet < 0))) ||
 	    (type != SOCK_DGRAM && type != SOCK_STREAM)) {
 		errno = EINVAL;
 		return -1;
