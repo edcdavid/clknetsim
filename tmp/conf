@@ -1,0 +1,4 @@
+node2_offset = 0.01
+node2_freq = 1e-6
+node2_delay1 = 1e-3
+node1_delay2 = 1e-3

@@ -20,6 +20,9 @@
 
 #define CONNECT_TIMEOUT 10
 
+/* Static flag for infinite simulation control */
+static volatile int infinite_simulation_running = 1;
+
 Packet_queue::Packet_queue() {
 }
 
@@ -270,6 +273,94 @@ bool Network::run(double time_limit) {
 	}
 
 	return true;
+}
+
+bool Network::run_infinite() {
+	int i, n = nodes.size(), waiting;
+	bool pending_update;
+	double min_timeout, timeout, next_update;
+
+	while (infinite_simulation_running) {
+		for (i = 0, waiting = 0; i < n; i++)
+			if (nodes[i]->waiting())
+				waiting++;
+			else 
+				stats[i].update_wakeup_stats();
+
+		while (waiting < n) {
+			for (i = 0; i < n; i++) {
+				if (nodes[i]->waiting())
+					continue;
+				if (!nodes[i]->process_fd()) {
+					fprintf(stderr, "client %d failed.\n", i + 1);
+					return false;
+				}
+				if (nodes[i]->waiting())
+					waiting++;
+			}
+		}
+
+		do {
+			min_timeout = nodes[0]->get_timeout();
+			for (i = 1; i < n; i++) {
+				timeout = nodes[i]->get_timeout();
+				if (min_timeout > timeout)
+					min_timeout = timeout;
+			}
+
+			timeout = packet_queue.get_timeout(time);
+			if (timeout <= min_timeout)
+				min_timeout = timeout;
+
+			next_update = floor(time) + (double)(update_count + 1) / update_rate;
+			timeout = next_update - time;
+			if (timeout <= min_timeout) {
+				min_timeout = timeout;
+				pending_update = true;
+			} else
+				pending_update = false;
+
+			//min_timeout += 1e-12;
+			assert(min_timeout >= 0.0);
+
+			if (pending_update)
+				time = next_update;
+			else
+				time += min_timeout;
+
+			for (i = 0; i < n; i++)
+				nodes[i]->get_clock()->advance(min_timeout);
+
+			if (pending_update)
+				update();
+			
+			/* Check if we should continue running (no time limit in infinite mode) */
+		} while (pending_update && infinite_simulation_running);
+
+		for (i = 0; i < n; i++)
+			nodes[i]->resume();
+
+		while (packet_queue.get_timeout(time) <= 0) {
+			assert(packet_queue.get_timeout(time) > -1e-10);
+			struct Packet *packet = packet_queue.dequeue();
+			stats[packet->to].update_packet_stats(true, time, packet->delay);
+			nodes[packet->to]->receive(packet);
+		}
+		
+		/* Check simulation_running flag at the end of each major iteration */
+		if (!infinite_simulation_running)
+			break;
+	}
+
+	return true;
+}
+
+void Network::stop_infinite_simulation() {
+	infinite_simulation_running = 0;
+}
+
+void Network::reset_infinite_simulation() {
+	infinite_simulation_running = 1;
 }
 
 void Network::update() {

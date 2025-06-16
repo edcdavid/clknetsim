@@ -85,6 +85,9 @@ class Network {
 	void set_link_delay_generator(unsigned int from, unsigned int to, Generator *generator);
 	void set_link_correction_generator(unsigned int from, unsigned int to, Generator *generator);
 	bool run(double time_limit);
+	bool run_infinite();
+	void stop_infinite_simulation();
+	void reset_infinite_simulation();
 	void open_offset_log(const char *log);
 	void open_freq_log(const char *log);
 	void open_rawfreq_log(const char *log);
